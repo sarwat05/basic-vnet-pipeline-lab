@@ -1,0 +1,84 @@
+name: deploy-vnet
+
+on:
+  pull_request:
+    paths: ["terraform/**"]
+  push:
+    branches: [main]
+    paths: ["terraform/**"]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Manual action"
+        type: choice
+        options: [plan, destroy]
+        default: plan
+
+permissions:
+  id-token: write # lets the job request an OIDC token for Azure (no stored secret)
+  contents: read
+
+env:
+  ARM_USE_OIDC: "true"
+  ARM_USE_AZUREAD: "true"
+  ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+  TF_VAR_subscription_id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+  TF_IN_AUTOMATION: "true"
+
+defaults:
+  run:
+    working-directory: terraform
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      # ---- CI: check the code before touching Azure ----
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Format check (informational)
+        continue-on-error: true
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      # ---- Troubleshooting aid: shows exactly what GitHub will present to Azure ----
+      - name: Show the OIDC claims for this run
+        run: |
+          python3 - <<'PY'
+          import os, json, base64, urllib.request
+          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=api://AzureADTokenExchange"
+          req = urllib.request.Request(url, headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          token = json.load(urllib.request.urlopen(req))["value"]
+          part = token.split(".")[1]
+          part += "=" * (-len(part) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(part))
+          print({k: claims[k] for k in ("iss", "aud", "sub")})
+          PY
+
+      # ---- CD: talk to Azure ----
+      - name: Init (remote state)
+        run: >
+          terraform init -reconfigure -input=false
+          -backend-config="resource_group_name=${{ vars.TFSTATE_RG }}"
+          -backend-config="storage_account_name=${{ vars.TFSTATE_SA }}"
+          -backend-config="container_name=tfstate"
+          -backend-config="key=basic-vnet.tfstate"
+
+      - name: Plan
+        if: github.event_name != 'workflow_dispatch' || inputs.action == 'plan'
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Apply (only on push to main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: terraform apply -input=false tfplan
+
+      - name: Destroy (manual run only)
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
+        run: terraform destroy -input=false -auto-approve
